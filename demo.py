@@ -1,3 +1,6 @@
+import numpy as np
+np.float = float
+
 import os
 import argparse
 import os.path as osp
@@ -7,7 +10,6 @@ from collections import defaultdict
 import cv2
 import torch
 import joblib
-import numpy as np
 from loguru import logger
 from progress.bar import Bar
 
