@@ -44,7 +44,7 @@ class SLAMModel(object):
             line = f'{focal_length} {focal_length} {center_x} {center_y}'
             fopen.write(line)
             
-    def track(self, ):
+    def track(self, video_path):
         (t, image, intrinsics) = self.queue.get()
         
         if t < 0: return
@@ -55,11 +55,12 @@ class SLAMModel(object):
         if self.slam is None:
             cfg.merge_from_file(self.dpvo_cfg)
             cfg.BUFFER_SIZE = self.buffer
+            cfg.MIXED_PRECISION = False # Added by JA for debugging
             self.slam = DPVO(cfg, self.dpvo_ckpt, ht=image.shape[1], wd=image.shape[2], viz=False)
         
         with Timer("SLAM", enabled=False):
             t = time.time()
-            self.slam(t, image, intrinsics)
+            self.slam(t, image, intrinsics, video_path)
             self.times.append(time.time() - t)
             
     def process(self, ):

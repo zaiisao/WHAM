@@ -73,6 +73,85 @@ def run(cfg,
                 bar.next()
 
             tracking_results = detector.process(fps)
+
+            # =========================================================================
+            # PATCH: THE FRAGMENT STITCHER (Safely glues broken timelines together)
+            # =========================================================================
+            print("\n" + "="*40)
+            print(f"Original Tracking IDs (Fragmented): {len(tracking_results)}")
+            
+            fragments = []
+            for tid, data in tracking_results.items():
+                f_key = 'frame_id' if 'frame_id' in data else 'frames'
+                if f_key not in data or len(data[f_key]) == 0: continue
+                
+                fragments.append({
+                    'id': tid,
+                    'start_f': data[f_key][0],
+                    'end_f': data[f_key][-1],
+                    'data': data,
+                    'start_bbox': data['bbox'][0],
+                    'end_bbox': data['bbox'][-1]
+                })
+            
+            # Sort fragments chronologically by their start time
+            fragments.sort(key=lambda x: x['start_f'])
+            
+            stitched_timelines = []
+            MAX_GAP_FRAMES = 90  # Wait up to 3 seconds for occlusion to end
+            MAX_SPATIAL_DIST = 1.0 # Bounding box distance threshold
+            
+            for frag in fragments:
+                matched = False
+                for timeline in stitched_timelines:
+                    last_frag = timeline[-1]
+                    gap = frag['start_f'] - last_frag['end_f']
+                    
+                    # If the temporal gap is reasonable (person was hidden briefly)
+                    if 0 < gap <= MAX_GAP_FRAMES:
+                        # Check spatial distance (did they reappear near where they vanished?)
+                        dx = frag['start_bbox'][0] - last_frag['end_bbox'][0]
+                        dy = frag['start_bbox'][1] - last_frag['end_bbox'][1]
+                        dist = (dx**2 + dy**2)**0.5
+                        avg_scale = (frag['start_bbox'][2] + last_frag['end_bbox'][2]) / 2.0
+                        
+                        if dist / (avg_scale + 1e-6) < MAX_SPATIAL_DIST:
+                            timeline.append(frag)
+                            matched = True
+                            break
+                            
+                if not matched:
+                    stitched_timelines.append([frag])
+            
+            # Rebuild tracking_results from the glued timelines
+            merged_results = {}
+            for i, timeline in enumerate(stitched_timelines):
+                merged_data = {'frame_id': [], 'bbox': [], 'keypoints': []}
+                for frag in timeline:
+                    f_key = 'frame_id' if 'frame_id' in frag['data'] else 'frames'
+                    merged_data['frame_id'].extend(frag['data'][f_key])
+                    merged_data['bbox'].extend(frag['data']['bbox'])
+                    merged_data['keypoints'].extend(frag['data']['keypoints'])
+                
+                merged_data['frame_id'] = np.array(merged_data['frame_id'])
+                merged_data['bbox'] = np.array(merged_data['bbox'])
+                merged_data['keypoints'] = np.array(merged_data['keypoints'])
+                
+                # Fix keys and init lists to prevent KeyError downstream
+                merged_data['features'] = []
+                if cfg.FLIP_EVAL:
+                    merged_data['flipped_bbox'] = []
+                    merged_data['flipped_keypoints'] = []
+                    merged_data['flipped_features'] = []
+                    
+                # Quality gate: Only keep timelines longer than 2 seconds
+                if len(merged_data['frame_id']) > 60:
+                    merged_results[i] = merged_data
+                    
+            tracking_results = merged_results
+            print(f"Successfully stitched into {len(tracking_results)} continuous subjects.")
+            print("="*40 + "\n")
+            # =========================================================================
             
             if slam is not None: 
                 slam_results = slam.process()
@@ -173,11 +252,63 @@ def run(cfg,
         joblib.dump(results, osp.join(output_pth, "wham_output.pkl"))
      
     # Visualize
+    # if visualize:
+    #     from lib.vis.run_vis import run_vis_on_demo
+    #     with torch.no_grad():
+    #         run_vis_on_demo(cfg, video, results, output_pth, network.smpl, vis_global=run_global)
     if visualize:
         from lib.vis.run_vis import run_vis_on_demo
-        with torch.no_grad():
-            run_vis_on_demo(cfg, video, results, output_pth, network.smpl, vis_global=run_global)
+        import subprocess
         
+        with torch.no_grad():
+            for _id in results.keys():
+                logger.info(f"Generating full-length render for Fragment ID: {_id}")
+                
+                # 1. Create a specific sub-folder for this fragment
+                id_output_pth = osp.join(output_pth, f"fragment_{_id}")
+                os.makedirs(id_output_pth, exist_ok=True)
+                
+                single_subj_result = {_id: results[_id]}
+                
+                # 2. Render the full video (WHAM's default behavior)
+                run_vis_on_demo(cfg, video, single_subj_result, id_output_pth, network.smpl, vis_global=run_global)
+                
+                # =========================================================================
+                # 3. NEW PATCH: THE AUTO-CROPPER
+                # =========================================================================
+                # Find the video WHAM just generated
+                generated_videos = glob(osp.join(id_output_pth, '*.mp4'))
+                if len(generated_videos) > 0:
+                    raw_render = generated_videos[0]
+                    cropped_render = osp.join(id_output_pth, f"cropped_id{_id}.mp4")
+                    
+                    # Calculate exact timestamps based on frame indices
+                    frames = results[_id]['frame_ids']
+                    start_frame = int(min(frames))
+                    end_frame = int(max(frames))
+                    
+                    start_time = start_frame / fps
+                    duration = (end_frame - start_frame + 1) / fps
+                    
+                    logger.info(f"Cropping ID {_id} from {start_time:.2f}s to {start_time+duration:.2f}s")
+                    
+                    # FFmpeg command: Re-encode to ensure exact frame-level cuts
+                    cmd = [
+                        'ffmpeg', '-y', 
+                        '-ss', str(start_time), 
+                        '-t', str(duration),
+                        '-i', raw_render, 
+                        '-c:v', 'libx264', '-crf', '23', '-preset', 'fast', 
+                        cropped_render
+                    ]
+                    
+                    # Execute FFmpeg silently
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    
+                    # Delete the uncropped full video to save disk space
+                    os.remove(raw_render)
+                    logger.info(f"Saved precise cropped clip: {cropped_render}")
+                # =========================================================================        
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 

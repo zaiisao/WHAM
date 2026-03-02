@@ -22,10 +22,12 @@ ROOT_DIR = osp.abspath(f"{__file__}/../../../../")
 VIT_DIR = osp.join(ROOT_DIR, "third-party/ViTPose")
 
 VIS_THRESH = 0.3
-BBOX_CONF = 0.5
-TRACKING_THR = 0.1
+BBOX_CONF = 0.4
+TRACKING_THR = 0.25
 MINIMUM_FRMAES = 30
 MINIMUM_JOINTS = 6
+MAX_TRACK_AGE = 60
+MIN_TRACK_SECONDS = 2.5
 
 class DetectionModel(object):
     def __init__(self, device):
@@ -45,6 +47,7 @@ class DetectionModel(object):
         self.next_id = 0
         self.frame_id = 0
         self.pose_results_last = []
+        self.track_memory = {}
         self.tracking_results = {
             'id': [],
             'frame_id': [],
@@ -97,7 +100,7 @@ class DetectionModel(object):
             pose_results,
             self.pose_results_last,
             self.next_id,
-            use_oks=False,
+            use_oks=True,
             tracking_thr=TRACKING_THR,
             use_one_euro=True,
             fps=fps)
@@ -121,6 +124,11 @@ class DetectionModel(object):
     def process(self, fps):
         for key in ['id', 'frame_id', 'keypoints']:
             self.tracking_results[key] = np.array(self.tracking_results[key])
+
+        if len(self.tracking_results['keypoints']) == 0:
+            print("⚠️ No humans detected in video. Skipping.")
+            return {}
+
         self.compute_bboxes_from_keypoints()
             
         output = defaultdict(lambda: defaultdict(list))
@@ -132,9 +140,10 @@ class DetectionModel(object):
                 output[_id][key] = val[idxs]
         
         # Smooth bounding box detection
+        min_track_frames = max(MINIMUM_FRMAES, int(fps * MIN_TRACK_SECONDS))
         ids = list(output.keys())
         for _id in ids:
-            if len(output[_id]['bbox']) < MINIMUM_FRMAES:
+            if len(output[_id]['bbox']) < min_track_frames:
                 del output[_id]
                 continue
             
