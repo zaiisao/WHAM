@@ -3,3 +3,7 @@ examples/
 output/
 checkpoints/
 __pycache__/
+
+wham.egg-info/
+
+crash_dumps/
